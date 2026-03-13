@@ -175,6 +175,8 @@ def handle_search(user_id, query):
         return
     text, links, final_url = fetch_page(top_url)
     if not text:
+        # Page failed to load — use snippet as the "text" so !more still works
+        save_session(user_id, top_url, snippet or query, [])
         send(f"🔍 {query}\n\n{snippet}\n\n-- Reply !more for more detail")
         return
     summary = summarize(text, final_url)
