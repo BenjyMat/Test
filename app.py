@@ -243,7 +243,9 @@ def groupme_webhook():
 def index():
     return "🌐 SMS Browser Bot is live!"
 
+# Run at import time so gunicorn initializes the DB
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
