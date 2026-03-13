@@ -158,47 +158,36 @@ def summarize(page_text, url, mode="normal"):
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 def handle_url(user_id, url):
-    send(f"🌐 Loading {url[:60]}...")
+    send("🌐 Loading page...")
     text, links, final_url = fetch_page(url)
     if not text:
-        send("❌ Couldn't load that page. Try a different URL.")
+        send("❌ Couldn't load that page. Try a different search instead.")
         return
     summary = summarize(text, final_url)
     save_session(user_id, final_url, text, links)
-    send(f"📄 {final_url}\n\n{summary}\n\n-- Reply !more for details, !links for links")
+    send(f"📄 {summary}\n\n-- Reply !more for more detail")
 
 def handle_search(user_id, query):
     send(f"🔍 Searching: {query}...")
     top_url, snippet = duckduckgo_search(query)
     if not top_url:
-        send(f"❌ No results found for '{query}'")
+        send(f"❌ No results found for '{query}'. Try different words.")
         return
     text, links, final_url = fetch_page(top_url)
     if not text:
-        send(f"🔍 {query}\n\nTop result: {top_url}\n{snippet}")
+        send(f"🔍 {query}\n\n{snippet}\n\n-- Reply !more for more detail")
         return
     summary = summarize(text, final_url)
     save_session(user_id, final_url, text, links)
-    send(f"🔍 {query}\n📄 {final_url}\n\n{summary}\n\n-- Reply !more or !links")
+    send(f"🔍 {query}\n\n{summary}\n\n-- Reply !more for more detail")
 
 def handle_more(user_id):
     url, text, _ = get_session(user_id)
     if not text:
-        send("No page loaded yet! Send a URL or search first.")
+        send("No page loaded yet! Send a search first.")
         return
     send("📖 Getting more detail...")
     send(summarize(text, url, mode="more"))
-
-def handle_links(user_id):
-    _, _, links = get_session(user_id)
-    if not links:
-        send("No links saved from last page.")
-        return
-    lines = ["🔗 Links from last page:"]
-    for i, link in enumerate(links[:8], 1):
-        lines.append(f"{i}. {link[:80]}")
-    lines.append("\nSend any URL to visit it!")
-    send("\n".join(lines))
 
 def handle_help():
     send(
@@ -207,10 +196,7 @@ def handle_help():
         "  weather New York\n"
         "  latest news today\n"
         "  how to make pasta\n\n"
-        "Or send a URL:\n"
-        "  https://bbc.com\n\n"
-        "!more   - more detail\n"
-        "!links  - page links\n"
+        "!more   - more detail on last result\n"
         "!help   - this menu\n\n"
         "Powered by Mistral AI (free!)"
     )
@@ -231,8 +217,8 @@ def groupme_webhook():
         handle_help()
     elif cmd == "!more":
         handle_more(user_id)
-    elif cmd == "!links":
-        handle_links(user_id)
+    #elif cmd == "!links":
+        #handle_links(user_id)
     elif is_url(text):
         handle_url(user_id, normalize_url(text))
     else:
