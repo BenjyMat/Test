@@ -1,19 +1,21 @@
 """
 GroupMe SMS Internet Browser — powered by Mistral AI (FREE)
-─────────────────────────────
-  - Any text       → searches DuckDuckGo & summarizes top result
-  - A URL          → fetches & summarizes the page
-  - !more          → more detail on last page
-  - !links         → links from last page
-  - !help          → show commands
+Commands:
+  Any text           → search the web
+  https://...        → load a URL
+  !more              → more detail
+  !find something    → find specific info on page
+  !links             → show numbered links
+  !open N            → visit link number N
+  !back              → go back to previous page
+  !submit key=val    → fill & submit a form
+  !help              → all commands
 """
 
 from flask import Flask, request, jsonify
 import requests as req
 from bs4 import BeautifulSoup
-import sqlite3
-import re
-import os
+import sqlite3, re, os
 from urllib.parse import quote_plus, urlparse, unquote
 
 app = Flask(__name__)
@@ -22,218 +24,220 @@ BOT_ID          = os.environ.get("GROUPME_BOT_ID", "ec1fe761adc29359ba5b4d55b8")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 DB_PATH         = "browser.db"
 MAX_MSG         = 900
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                user_id    TEXT PRIMARY KEY,
-                last_url   TEXT,
-                last_text  TEXT,
-                last_links TEXT
-            )
-        """)
+        conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            user_id TEXT PRIMARY KEY, last_url TEXT, last_text TEXT,
+            last_links TEXT, prev_url TEXT, prev_text TEXT, prev_links TEXT, last_html TEXT)""")
+        for col in ["prev_url","prev_text","prev_links","last_html"]:
+            try: conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+            except: pass
 
-def save_session(user_id, url, text, links):
+def save_session(user_id, url, text, links, html=""):
+    s = get_session(user_id)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO sessions (user_id, last_url, last_text, last_links)
-            VALUES (?,?,?,?)
+        conn.execute("""INSERT INTO sessions
+            (user_id,last_url,last_text,last_links,prev_url,prev_text,prev_links,last_html)
+            VALUES (?,?,?,?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
-                last_url=excluded.last_url,
-                last_text=excluded.last_text,
-                last_links=excluded.last_links
-        """, (user_id, url, text[:5000], "|".join(links[:20])))
+                prev_url=sessions.last_url, prev_text=sessions.last_text, prev_links=sessions.last_links,
+                last_url=excluded.last_url, last_text=excluded.last_text,
+                last_links=excluded.last_links, last_html=excluded.last_html""",
+            (user_id, url, text[:5000], "|".join(links[:30]),
+             s[0] or "", s[1] or "", "|".join(s[2]) if s[2] else "", html[:10000]))
 
 def get_session(user_id):
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT last_url, last_text, last_links FROM sessions WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-    if not row:
-        return None, None, []
-    links = row[2].split("|") if row[2] else []
-    return row[0], row[1], links
+        row = conn.execute("SELECT last_url,last_text,last_links,prev_url,prev_text,prev_links,last_html FROM sessions WHERE user_id=?",(user_id,)).fetchone()
+    if not row: return None,None,[],None,None,[],"" 
+    return row[0],row[1],(row[2].split("|") if row[2] else []),row[3],row[4],(row[5].split("|") if row[5] else []),(row[6] or "")
 
 # ── GroupMe ───────────────────────────────────────────────────────────────────
 
 def send(text):
-    chunks = [text[i:i+MAX_MSG] for i in range(0, len(text), MAX_MSG)]
-    for chunk in chunks:
-        req.post("https://api.groupme.com/v3/bots/post", json={
-            "bot_id": BOT_ID,
-            "text": chunk
-        })
+    for chunk in [text[i:i+MAX_MSG] for i in range(0,len(text),MAX_MSG)]:
+        req.post("https://api.groupme.com/v3/bots/post", json={"bot_id":BOT_ID,"text":chunk})
 
-# ── Web helpers ───────────────────────────────────────────────────────────────
+# ── Web ───────────────────────────────────────────────────────────────────────
 
-def is_url(text):
-    return bool(re.match(r'https?://', text)) or bool(re.match(r'www\.', text))
-
-def normalize_url(text):
-    return "https://" + text if text.startswith("www.") else text
+def is_url(t): return bool(re.match(r'https?://',t)) or bool(re.match(r'www\.',t))
+def normalize_url(t): return "https://"+t if t.startswith("www.") else t
 
 def fetch_page(url):
     try:
-        resp = req.get(url, headers=HEADERS, timeout=12, allow_redirects=True)
-        resp.raise_for_status()
-        final_url = resp.url
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script","style","nav","footer","header",
-                          "aside","form","noscript","iframe","svg"]):
-            tag.decompose()
-        text = re.sub(r'\s+', ' ', soup.get_text(separator=" ", strip=True)).strip()
-        base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+        r = req.get(url, headers=HEADERS, timeout=12, allow_redirects=True)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        html = str(soup)[:10000]
+        for tag in soup(["script","style","noscript","iframe","svg"]): tag.decompose()
+        text = re.sub(r'\s+',' ', soup.get_text(separator=" ",strip=True)).strip()
+        base = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
         links = []
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("http"):
-                links.append(href)
-            elif href.startswith("/"):
-                links.append(base + href)
-        return text[:6000], list(dict.fromkeys(links))[:20], final_url
-    except Exception:
-        return None, [], url
+            h = a["href"].strip()
+            if h.startswith("http"): links.append(h)
+            elif h.startswith("//"): links.append("https:"+h)
+            elif h.startswith("/"): links.append(base+h)
+        seen=set(); deduped=[]
+        for l in links:
+            if l not in seen: seen.add(l); deduped.append(l)
+        return text[:6000], deduped[:30], r.url, html
+    except: return None,[],url,""
 
-def duckduckgo_search(query):
+def ddg_search(query):
     try:
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        resp = req.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        results  = soup.select(".result__a")
+        r = req.get(f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text,"html.parser")
+        results = soup.select(".result__a")
         snippets = soup.select(".result__snippet")
-        if not results:
-            return None, None
-        href = results[0].get("href", "")
-        match = re.search(r'uddg=([^&]+)', href)
-        top_url = unquote(match.group(1)) if match else (href if href.startswith("http") else None)
-        snippet = snippets[0].get_text(strip=True) if snippets else ""
-        return top_url, snippet
-    except Exception:
-        return None, None
+        if not results: return None,None
+        href = results[0].get("href","")
+        m = re.search(r'uddg=([^&]+)', href)
+        top = unquote(m.group(1)) if m else (href if href.startswith("http") else None)
+        return top, (snippets[0].get_text(strip=True) if snippets else "")
+    except: return None,None
 
-# ── Mistral AI summarizer ─────────────────────────────────────────────────────
+# ── AI ────────────────────────────────────────────────────────────────────────
 
-def summarize(page_text, url, mode="normal"):
-    instruction = (
-        "Give a more detailed summary. Plain text only, no markdown, no bullets. "
-        "Under 800 characters. Include key facts, numbers, names, dates."
-    ) if mode == "more" else (
-        "Summarize this webpage in plain conversational text. No markdown, no bullets. "
-        "Under 500 characters. Lead with the most important info. "
-        "Write like you're texting a friend what the page says."
-    )
+def ai(prompt, max_tokens=400):
     try:
-        resp = req.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {MISTRAL_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "mistral-small-latest",
-                "max_tokens": 400,
-                "messages": [{
-                    "role": "user",
-                    "content": f"URL: {url}\n\nPAGE:\n{page_text[:4000]}\n\n{instruction}"
-                }]
-            },
-            timeout=20
-        )
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"AI error: {e}"
+        r = req.post("https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization":f"Bearer {MISTRAL_API_KEY}","Content-Type":"application/json"},
+            json={"model":"mistral-small-latest","max_tokens":max_tokens,"messages":[{"role":"user","content":prompt}]},
+            timeout=20)
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e: return f"AI error: {e}"
+
+def summarize(text, url, mode="normal"):
+    ins = ("Give a detailed summary. Plain text, no markdown, no bullets. Under 800 chars. Include key facts, numbers, names." if mode=="more"
+           else "Summarize this webpage in plain text. No markdown. Under 500 chars. Lead with the most important info. Write like texting a friend.")
+    return ai(f"URL: {url}\n\nPAGE:\n{text[:4000]}\n\n{ins}")
+
+def find_in_page(text, query):
+    return ai(f"From this webpage, find info about: {query}\n\nPAGE:\n{text[:4000]}\n\nDirect plain text answer, under 500 chars. If not found, say so.")
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 def handle_url(user_id, url):
     send("🌐 Loading page...")
-    text, links, final_url = fetch_page(url)
-    if not text:
-        send("❌ Couldn't load that page. Try a different search instead.")
-        return
-    summary = summarize(text, final_url)
-    save_session(user_id, final_url, text, links)
-    send(f"📄 {summary}\n\n-- Reply !more for more detail")
+    text,links,final_url,html = fetch_page(url)
+    if not text: send("❌ Couldn't load that page."); return
+    save_session(user_id, final_url, text, links, html)
+    send(f"📄 {summarize(text,final_url)}\n\n-- !more !find X !links !open N !back")
 
 def handle_search(user_id, query):
     send(f"🔍 Searching: {query}...")
-    top_url, snippet = duckduckgo_search(query)
-    if not top_url:
-        send(f"❌ No results found for '{query}'. Try different words.")
-        return
-    text, links, final_url = fetch_page(top_url)
+    top_url, snippet = ddg_search(query)
+    if not top_url: send(f"❌ No results for '{query}'."); return
+    text,links,final_url,html = fetch_page(top_url)
     if not text:
-        # Page failed to load — use snippet as the "text" so !more still works
-        save_session(user_id, top_url, snippet or query, [])
-        send(f"🔍 {query}\n\n{snippet}\n\n-- Reply !more for more detail")
-        return
-    summary = summarize(text, final_url)
-    save_session(user_id, final_url, text, links)
-    send(f"🔍 {query}\n\n{summary}\n\n-- Reply !more for more detail")
+        save_session(user_id, top_url, snippet or query, [], "")
+        send(f"🔍 {query}\n\n{snippet}\n\n-- !more !back"); return
+    save_session(user_id, final_url, text, links, html)
+    send(f"🔍 {query}\n\n{summarize(text,final_url)}\n\n-- !more !find X !links !open N !back")
 
 def handle_more(user_id):
-    url, text, _ = get_session(user_id)
-    if not text:
-        send("No page loaded yet! Send a search first.")
-        return
-    send("📖 Getting more detail...")
-    send(summarize(text, url, mode="more"))
+    url,text,_,_,_,_,_ = get_session(user_id)
+    if not text: send("No page loaded yet!"); return
+    send("📖 More detail..."); send(summarize(text,url,mode="more"))
+
+def handle_find(user_id, query):
+    url,text,_,_,_,_,_ = get_session(user_id)
+    if not text: send("No page loaded yet!"); return
+    send(f"🔎 Finding: {query}...")
+    send(find_in_page(text, query))
+
+def handle_links(user_id):
+    _,_,links,_,_,_,_ = get_session(user_id)
+    if not links: send("No links on this page."); return
+    lines = ["🔗 Links (type !open N):"]
+    for i,link in enumerate(links[:10],1):
+        label = urlparse(link).path.strip("/").split("/")[-1] or urlparse(link).netloc
+        lines.append(f"{i}. {(label or link)[:50]}")
+    send("\n".join(lines))
+
+def handle_open(user_id, n_str):
+    _,_,links,_,_,_,_ = get_session(user_id)
+    try:
+        n = int(n_str); assert 1 <= n <= len(links)
+    except: send("❌ Use !links to see links, then !open N with a valid number."); return
+    handle_url(user_id, links[n-1])
+
+def handle_back(user_id):
+    _,_,_,prev_url,prev_text,prev_links,_ = get_session(user_id)
+    if not prev_url: send("Nothing to go back to!"); return
+    send("⬅️ Going back...")
+    text,links,final_url,html = fetch_page(prev_url)
+    if not text: text,links,final_url,html = prev_text,prev_links,prev_url,""
+    save_session(user_id, final_url, text, links, html)
+    send(f"📄 {summarize(text,final_url)}\n\n-- !more !find X !links !open N !back")
+
+def handle_submit(user_id, form_data):
+    url,_,_,_,_,_,html = get_session(user_id)
+    if not html: send("❌ No page loaded."); return
+    soup = BeautifulSoup(html,"html.parser")
+    forms = soup.find_all("form")
+    if not forms: send("❌ No forms found on this page."); return
+    form = forms[0]
+    action = form.get("action", url) or url
+    method = form.get("method","get").lower()
+    if not action.startswith("http"):
+        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        action = base + (action if action.startswith("/") else "/"+action)
+    fields = {}
+    for part in form_data.split(","):
+        part = part.strip()
+        if "=" in part:
+            k,v = part.split("=",1); fields[k.strip()] = v.strip()
+    for inp in form.find_all(["input","textarea","select"]):
+        name = inp.get("name")
+        if name and name not in fields and inp.get("type","").lower() == "hidden":
+            fields[name] = inp.get("value","")
+    send(f"📤 Submitting form...")
+    try:
+        r = (req.post if method=="post" else req.get)(action, **{"data" if method=="post" else "params": fields}, headers=HEADERS, timeout=12, allow_redirects=True)
+        soup2 = BeautifulSoup(r.text,"html.parser")
+        html2 = str(soup2)[:10000]
+        for tag in soup2(["script","style","noscript","iframe","svg"]): tag.decompose()
+        text2 = re.sub(r'\s+',' ',soup2.get_text(separator=" ",strip=True)).strip()[:6000]
+        base = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
+        links2 = [a["href"] if a["href"].startswith("http") else base+a["href"] for a in soup2.find_all("a",href=True) if a["href"].startswith(("/","http"))]
+        save_session(user_id, r.url, text2, links2, html2)
+        send(f"✅ Done!\n\n{summarize(text2,r.url)}\n\n-- !more !find X !open N !back")
+    except Exception as e: send(f"❌ Submit failed: {e}")
 
 def handle_help():
-    send(
-        "🌐 SMS BROWSER\n\n"
-        "Type anything to search:\n"
-        "  weather New York\n"
-        "  latest news today\n"
-        "  how to make pasta\n\n"
-        "!more   - more detail on last result\n"
-        "!help   - this menu\n\n"
-        "Powered by Mistral AI (free!)"
-    )
+    send("🌐 SMS BROWSER\n\nSearch: type anything\nLoad: https://...\n\n!more — more detail\n!find price — find info on page\n!links — show links\n!open 3 — visit link 3\n!back — go back\n!submit email=x,pass=y — submit form\n!help — this menu\n\nPowered by Mistral AI")
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
 @app.route("/groupme", methods=["POST"])
 def groupme_webhook():
     data = request.get_json(silent=True) or {}
-    if data.get("sender_type") == "bot":
-        return jsonify(ok=True)
+    if data.get("sender_type") == "bot": return jsonify(ok=True)
     text    = (data.get("text") or "").strip()
-    user_id = data.get("user_id", "unknown")
-    if not text:
-        return jsonify(ok=True)
-    cmd = text.lower()
-    if cmd == "!help":
-        handle_help()
-    elif cmd == "!more":
-        handle_more(user_id)
-    #elif cmd == "!links":
-        #handle_links(user_id)
-    elif is_url(text):
-        handle_url(user_id, normalize_url(text))
-    else:
-        handle_search(user_id, text)
+    user_id = data.get("user_id","unknown")
+    if not text: return jsonify(ok=True)
+    lower = text.lower()
+    if lower == "!help":           handle_help()
+    elif lower == "!more":         handle_more(user_id)
+    elif lower == "!back":         handle_back(user_id)
+    elif lower == "!links":        handle_links(user_id)
+    elif lower.startswith("!open "):   handle_open(user_id, text[6:].strip())
+    elif lower.startswith("!find "):   handle_find(user_id, text[6:].strip())
+    elif lower.startswith("!submit "): handle_submit(user_id, text[8:].strip())
+    elif is_url(text):             handle_url(user_id, normalize_url(text))
+    else:                          handle_search(user_id, text)
     return jsonify(ok=True)
 
 @app.route("/")
-def index():
-    return "🌐 SMS Browser Bot is live!"
+def index(): return "🌐 SMS Browser Bot is live!"
 
-# Run at import time so gunicorn initializes the DB
 init_db()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
