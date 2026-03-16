@@ -1,7 +1,7 @@
 """
 GroupMe SMS Internet Browser — powered by Mistral AI (FREE)
 Commands:
-  Any text           → search the web
+  Any text           → AI answers directly, searches web if needed
   https://...        → load a URL
   !more              → more detail
   !find something    → find specific info on page
@@ -89,21 +89,24 @@ def fetch_page(url):
     except: return None,[],url,""
 
 def ddg_search(query):
+    """Try DuckDuckGo, fall back to a direct fetch if it fails."""
     try:
         r = req.get(f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text,"html.parser")
         results = soup.select(".result__a")
         snippets = soup.select(".result__snippet")
-        if not results: return None,None
-        href = results[0].get("href","")
-        m = re.search(r'uddg=([^&]+)', href)
-        top = unquote(m.group(1)) if m else (href if href.startswith("http") else None)
-        return top, (snippets[0].get_text(strip=True) if snippets else "")
-    except: return None,None
+        if results:
+            href = results[0].get("href","")
+            m = re.search(r'uddg=([^&]+)', href)
+            top = unquote(m.group(1)) if m else (href if href.startswith("http") else None)
+            snippet = snippets[0].get_text(strip=True) if snippets else ""
+            if top: return top, snippet
+    except: pass
+    return None, None
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
-def ai(prompt, max_tokens=400):
+def ai(prompt, max_tokens=350):
     try:
         r = req.post("https://api.mistral.ai/v1/chat/completions",
             headers={"Authorization":f"Bearer {MISTRAL_API_KEY}","Content-Type":"application/json"},
@@ -112,13 +115,31 @@ def ai(prompt, max_tokens=400):
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e: return f"AI error: {e}"
 
+def needs_web_search(query):
+    """Decide if a query needs a live web search or can be answered by AI directly."""
+    prompt = (
+        f'Does this question require a current web search to answer accurately, '
+        f'or can it be answered from general knowledge?\n'
+        f'Question: "{query}"\n'
+        f'Reply with just one word: SEARCH or ANSWER'
+    )
+    result = ai(prompt, max_tokens=5)
+    return "SEARCH" in result.upper()
+
+def direct_answer(query):
+    """Answer a question directly with AI, short and conversational."""
+    return ai(
+        f"Answer this question directly and concisely. Plain text only, no markdown, no bullets. "
+        f"Under 400 characters. Be direct like texting a friend.\n\nQuestion: {query}"
+    )
+
 def summarize(text, url, mode="normal"):
-    ins = ("Give a detailed summary. Plain text, no markdown, no bullets. Under 800 chars. Include key facts, numbers, names." if mode=="more"
-           else "Summarize this webpage in plain text. No markdown. Under 500 chars. Lead with the most important info. Write like texting a friend.")
+    ins = ("Give a detailed plain text summary, no markdown, no bullets. Under 800 chars. Key facts, numbers, names." if mode=="more"
+           else "Summarize this webpage in plain text. No markdown. Under 400 chars. Most important info first. Like texting a friend.")
     return ai(f"URL: {url}\n\nPAGE:\n{text[:4000]}\n\n{ins}")
 
 def find_in_page(text, query):
-    return ai(f"From this webpage, find info about: {query}\n\nPAGE:\n{text[:4000]}\n\nDirect plain text answer, under 500 chars. If not found, say so.")
+    return ai(f"From this webpage, find info about: {query}\n\nPAGE:\n{text[:4000]}\n\nDirect plain text answer, under 400 chars. If not found, say so clearly.")
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -129,16 +150,30 @@ def handle_url(user_id, url):
     save_session(user_id, final_url, text, links, html)
     send(f"📄 {summarize(text,final_url)}\n\n-- !more !find X !links !open N !back")
 
-def handle_search(user_id, query):
-    send(f"🔍 Searching: {query}...")
-    top_url, snippet = ddg_search(query)
-    if not top_url: send(f"❌ No results for '{query}'."); return
-    text,links,final_url,html = fetch_page(top_url)
-    if not text:
-        save_session(user_id, top_url, snippet or query, [], "")
-        send(f"🔍 {query}\n\n{snippet}\n\n-- !more !back"); return
-    save_session(user_id, final_url, text, links, html)
-    send(f"🔍 {query}\n\n{summarize(text,final_url)}\n\n-- !more !find X !links !open N !back")
+def handle_query(user_id, query):
+    """Smart handler - answers directly if possible, searches web if needed."""
+    # Very short/trivial inputs - ignore
+    if len(query.strip()) <= 2:
+        return
+
+    send(f"🤔 Looking up: {query}...")
+
+    # Ask AI if this needs a web search
+    if needs_web_search(query):
+        top_url, snippet = ddg_search(query)
+        if top_url:
+            text,links,final_url,html = fetch_page(top_url)
+            if text:
+                save_session(user_id, final_url, text, links, html)
+                send(f"🔍 {summarize(text,final_url)}\n\n-- !more !find X !links !open N !back")
+                return
+        # DDG failed or page failed - fall back to AI with snippet hint
+        hint = f"Search snippet hint: {snippet}\n\n" if snippet else ""
+        answer = ai(f"{hint}Answer this directly in plain text, under 400 chars: {query}")
+        send(answer)
+    else:
+        # AI can answer directly
+        send(direct_answer(query))
 
 def handle_more(user_id):
     url,text,_,_,_,_,_ = get_session(user_id)
@@ -163,7 +198,7 @@ def handle_links(user_id):
 def handle_open(user_id, n_str):
     _,_,links,_,_,_,_ = get_session(user_id)
     try:
-        n = int(n_str); assert 1 <= n <= len(links)
+        n = int(n_str.strip()); assert 1 <= n <= len(links)
     except: send("❌ Use !links to see links, then !open N with a valid number."); return
     handle_url(user_id, links[n-1])
 
@@ -211,7 +246,24 @@ def handle_submit(user_id, form_data):
     except Exception as e: send(f"❌ Submit failed: {e}")
 
 def handle_help():
-    send("🌐 SMS BROWSER\n\nSearch: type anything\nLoad: https://...\n\n!more — more detail\n!find price — find info on page\n!links — show links\n!open 3 — visit link 3\n!back — go back\n!submit email=x,pass=y — submit form\n!help — this menu\n\nPowered by Mistral AI")
+    send(
+        "🌐 SMS BROWSER — Commands:\n\n"
+        "Just type anything to get an answer\n"
+        "  when are the oscars\n"
+        "  what does finagle mean\n"
+        "  lakers score tonight\n\n"
+        "Load a page:\n"
+        "  https://espn.com\n\n"
+        "On a page:\n"
+        "  !more — more detail\n"
+        "  !find price — find specific info\n"
+        "  !links — show page links\n"
+        "  !open 3 — visit link 3\n"
+        "  !back — go back\n"
+        "  !submit email=x,pass=y\n\n"
+        "!help — this menu\n"
+        "Powered by Mistral AI (free)"
+    )
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
@@ -222,16 +274,20 @@ def groupme_webhook():
     text    = (data.get("text") or "").strip()
     user_id = data.get("user_id","unknown")
     if not text: return jsonify(ok=True)
-    lower = text.lower()
-    if lower == "!help":           handle_help()
-    elif lower == "!more":         handle_more(user_id)
-    elif lower == "!back":         handle_back(user_id)
-    elif lower == "!links":        handle_links(user_id)
+
+    # Normalize command — lowercase, remove spaces after !
+    lower = re.sub(r'^!\s+', '!', text.lower())
+
+    if lower == "!help":               handle_help()
+    elif lower == "!more":             handle_more(user_id)
+    elif lower == "!back":             handle_back(user_id)
+    elif lower == "!links":            handle_links(user_id)
     elif lower.startswith("!open "):   handle_open(user_id, text[6:].strip())
     elif lower.startswith("!find "):   handle_find(user_id, text[6:].strip())
     elif lower.startswith("!submit "): handle_submit(user_id, text[8:].strip())
-    elif is_url(text):             handle_url(user_id, normalize_url(text))
-    else:                          handle_search(user_id, text)
+    elif is_url(text):                 handle_url(user_id, normalize_url(text))
+    else:                              handle_query(user_id, text)
+
     return jsonify(ok=True)
 
 @app.route("/")
